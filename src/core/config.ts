@@ -395,10 +395,18 @@ export interface GBrainConfig {
     api_scope?: string;
     /** Transition aid — also accept v1-issuer tokens. Default false. */
     accept_v1_issuer?: boolean;
-    /** UPN-or-oid → scopes (string, array, or {scopes, source_id, federated_read}). */
-    identity_map?: Record<string, string | string[] | { scopes: string | string[]; source_id?: string; federated_read?: string[] }>;
+    /** UPN-or-oid → scopes (string, array, or {scopes, source_id, federated_read, write_prefixes}). */
+    identity_map?: Record<string, string | string[] | { scopes: string | string[]; source_id?: string; federated_read?: string[]; write_prefixes?: string[] }>;
     /** Grant for unmapped tenant identities. Default [] = deny. */
     default_scopes?: string[] | string;
+    /**
+     * Read-side ACL (identity-acl): slug prefix → invited identities (UPN or
+     * oid, case-insensitive). Pages under a masked prefix are invisible —
+     * existence included — to non-invited, non-admin Entra identities.
+     * Native/legacy tokens and the local CLI are exempt. Env override:
+     * GBRAIN_ENTRA_MASKED_PREFIXES (JSON, replaces the map wholesale).
+     */
+    masked_prefixes?: Record<string, string[]>;
   };
 
   /**

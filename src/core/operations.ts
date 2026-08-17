@@ -299,6 +299,23 @@ function slugOutsideCallerFence(ctx: OperationContext, slug: string): boolean {
 }
 
 /**
+ * The masked prefixes THIS caller may not see, or undefined when the caller
+ * is exempt (no auth, admin, native/legacy token — the field is only ever
+ * populated on the Entra verification path). Single accessor so read-side
+ * post-filters and the write-side fence key off the same field the same way.
+ */
+export function hiddenSlugPrefixesFor(ctx: OperationContext): string[] | undefined {
+  const hidden = ctx.auth?.hiddenSlugPrefixes;
+  return hidden && hidden.length > 0 ? hidden : undefined;
+}
+
+/** Is `slug` under a masked prefix this caller may not see? */
+export function slugHiddenFromCaller(ctx: OperationContext, slug: string): boolean {
+  const hidden = hiddenSlugPrefixesFor(ctx);
+  return hidden !== undefined && slugUnderBoundPrefixes(hidden, slug);
+}
+
+/**
  * OAuth-client slug-fence enforcement (v0.42.72.0 — write-side isolation
  * symmetry). When the authenticated client was registered with
  * --bound-slug-prefixes, every direct slug-mutating write must target a
@@ -315,8 +332,23 @@ function slugOutsideCallerFence(ctx: OperationContext, slug: string): boolean {
  * keep full-source write authority). Register prefixes with a trailing
  * slash ('wiki/agents/alice/') — a bare 'notes' also admits
  * 'notes-archive/...' by startsWith construction.
+ *
+ * identity-acl addition: also refuses writes into a masked prefix the
+ * caller is not invited to (can't write where you can't see).
  */
 function enforceClientSlugFence(ctx: OperationContext, slug: string, opName: string): void {
+  // Masked-prefix write fence (feature/identity-acl): a caller cannot write
+  // where it cannot see. Checked BEFORE the bound-prefix fence so an
+  // identity whose write_prefixes happen to cover a masked prefix it is not
+  // invited to is still refused. The message deliberately does NOT say the
+  // prefix is masked — it reads like any other write-grant refusal, so the
+  // error itself does not confirm that a restricted area exists there.
+  if (slugHiddenFromCaller(ctx, slug)) {
+    throw new OperationError(
+      'permission_denied',
+      `${opName}: slug '${slug}' is outside this identity's write grant`,
+    );
+  }
   if (ctx.auth?.fenceProjectionDegraded) {
     throw new OperationError(
       'permission_denied',
@@ -417,7 +449,13 @@ export function enforceBoundClientOpAllowList(
   // there isn't one. Deny every non-read op outright — otherwise the
   // unfenceable ops stay reachable precisely when the fence is unreadable.
   const degraded = auth?.fenceProjectionDegraded === true;
-  if (!degraded && !auth?.boundSlugPrefixes) return;
+  // Masked identities (hiddenSlugPrefixes, feature/identity-acl) get the same
+  // fail-closed op allow-list even when they carry no write_prefixes: an
+  // unfenceable write op (log_ingest, forget, extract_*) could otherwise
+  // mutate pages under a prefix the caller cannot even see. The allow-listed
+  // ops all route through enforceClientSlugFence, which refuses hidden slugs.
+  const masked = (auth?.hiddenSlugPrefixes?.length ?? 0) > 0;
+  if (!degraded && !auth?.boundSlugPrefixes && !masked) return;
   // Gate on "mutates, or carries any non-read scope" rather than on the two
   // literal scope strings 'write'/'admin': `sources_add` / `sources_remove`
   // carry the bespoke `sources_admin` scope and are `mutating: true`, so a
@@ -434,10 +472,19 @@ export function enforceBoundClientOpAllowList(
     );
   }
   if (CLIENT_FENCED_WRITE_OPS.has(op.name)) return;
+  if (auth?.boundSlugPrefixes) {
+    throw new OperationError(
+      'permission_denied',
+      `${op.name} is not available to slug-bound clients: it can write outside client ${auth?.clientId ?? '(unknown)'}'s bound_slug_prefixes (${(auth?.boundSlugPrefixes ?? []).join(', ')}).`,
+      'Use put_page / add_timeline_entry / add_link under your own prefixes, or ask an operator to clear the binding with `gbrain auth rescope-client <id> --bound-slug-prefixes none`.',
+    );
+  }
+  // Masked identity with no write binding: same fail-closed posture, message
+  // phrased as a write-grant limit (never as "there are hidden areas").
   throw new OperationError(
     'permission_denied',
-    `${op.name} is not available to slug-bound clients: it can write outside client ${auth?.clientId ?? '(unknown)'}'s bound_slug_prefixes (${(auth?.boundSlugPrefixes ?? []).join(', ')}).`,
-    'Use put_page / add_timeline_entry / add_link under your own prefixes, or ask an operator to clear the binding with `gbrain auth rescope-client <id> --bound-slug-prefixes none`.',
+    `${op.name} is not available to this identity: it can write outside the identity's write grant.`,
+    'Use put_page / add_timeline_entry / add_link, or ask the brain owner to widen your grant.',
   );
 }
 
@@ -561,6 +608,26 @@ export interface AuthInfo {
    * unaffected — this axis alone fails closed.
    */
   fenceProjectionDegraded?: boolean;
+  /**
+   * Read-side masking (feature/identity-acl): the masked slug prefixes this
+   * caller may NOT see — computed at token-verification time as (all
+   * configured `entra.masked_prefixes`) minus (prefixes whose invite list
+   * names this identity's UPN or oid). When present and non-empty:
+   *  - the dispatch layer swaps `ctx.engine` for a masked read view
+   *    (src/core/read-mask.ts) so every read surface behaves as if pages
+   *    under these prefixes do not exist;
+   *  - every slug-mutating write into a hidden prefix is refused
+   *    (can't write where you can't see — see enforceClientSlugFence);
+   *  - non-read ops outside CLIENT_FENCED_WRITE_OPS are denied at dispatch
+   *    (enforceBoundClientOpAllowList), because unfenceable write ops could
+   *    otherwise touch hidden pages by side effect.
+   *
+   * EXEMPT by construction (field never set): local CLI, native OAuth
+   * clients, legacy bearer tokens, and admin-scoped Entra identities.
+   * Uses the same prefix grammar + boundary-aware matcher
+   * (slugUnderBoundPrefixes) as boundSlugPrefixes above.
+   */
+  hiddenSlugPrefixes?: string[];
   /**
    * Entra JWT auth (src/core/entra-auth.ts): the verified Microsoft Entra ID
    * identity claims when the presented bearer token was an Entra-issued JWT.
@@ -1978,6 +2045,11 @@ const search: Operation = {
       expansion: false,
       ...scope,
       ...(perCallMode ? { mode: perCallMode } : {}),
+      // Masked callers bypass the query cache BOTH ways: a cache row written
+      // by an unmasked caller could serve them hidden slugs, and their
+      // post-filtered result set must never be stored where an unmasked
+      // caller would read it back (knobs_hash does not key on identity).
+      ...(hiddenSlugPrefixesFor(ctx) ? { useCache: false } : {}),
       onMeta: (m) => { capturedMeta = m; },
     });
     const latency_ms = Date.now() - startedAt;
@@ -2168,7 +2240,12 @@ const query: Operation = {
       until: typeof p.until === 'string' ? p.until : undefined,
       // v0.32.x search-lite: token budget + cache opt-outs.
       tokenBudget: typeof p.token_budget === 'number' ? (p.token_budget as number) : undefined,
-      useCache: typeof p.use_cache === 'boolean' ? (p.use_cache as boolean) : undefined,
+      // Masked callers (identity-acl) force the cache OFF regardless of the
+      // per-call flag: cache rows are not keyed by identity, so a hit could
+      // serve hidden slugs and a store could pollute unmasked readers.
+      useCache: hiddenSlugPrefixesFor(ctx)
+        ? false
+        : typeof p.use_cache === 'boolean' ? (p.use_cache as boolean) : undefined,
       intentWeighting: typeof p.intent_weighting === 'boolean' ? (p.intent_weighting as boolean) : undefined,
       // v0.36 cross-modal routing param.
       crossModal: p.cross_modal as 'text' | 'image' | 'both' | 'auto' | undefined,
@@ -4305,9 +4382,10 @@ const get_recent_transcripts: Operation = {
 const whoami: Operation = {
   name: 'whoami',
   description:
-    'Introspect the calling identity. Returns one of three transport shapes: ' +
+    'Introspect the calling identity. Returns one of the transport shapes: ' +
     '{transport: "oauth", client_id, client_name, scopes, expires_at, source_id, federated_read}, ' +
-    '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
+    '{transport: "entra", client_id, upn, oid, name, scopes, expires_at, source_id, federated_read, write_prefixes, masked_areas_hidden}, ' +
+    '{transport: "legacy", token_name, scopes, expires_at: null}, ' +
     '{transport: "local", scopes: []}, or {transport: "stdio", scopes: []} ' +
     'for the auth-less stdio MCP pipe. Throws unknown_transport when the ' +
     'context is ambiguous (remote=true without auth and no transport marker) ' +
@@ -4336,6 +4414,26 @@ const whoami: Operation = {
           'This is a transport bug — every remote call site must populate ctx.auth ' +
           'or set ctx.remote === false.',
       );
+    }
+    // Entra JWT callers (src/core/entra-auth.ts) carry the verified identity
+    // claims on ctx.auth.entra. Pre-fix they fell through to the legacy
+    // branch and were mislabeled {transport: 'legacy', expires_at: null}.
+    // `masked_areas_hidden` is deliberately a BOOLEAN — naming the hidden
+    // prefixes would defeat the existence-hiding the mask provides.
+    if (ctx.auth.entra) {
+      return {
+        transport: 'entra',
+        client_id: ctx.auth.clientId,
+        upn: ctx.auth.entra.preferredUsername ?? null,
+        oid: ctx.auth.entra.oid || null,
+        name: ctx.auth.entra.name ?? null,
+        scopes: ctx.auth.scopes,
+        expires_at: ctx.auth.expiresAt ?? null,
+        source_id: ctx.auth.sourceId ?? null,
+        federated_read: ctx.auth.allowedSources ?? [],
+        write_prefixes: ctx.auth.boundSlugPrefixes ?? [],
+        masked_areas_hidden: (ctx.auth.hiddenSlugPrefixes?.length ?? 0) > 0,
+      };
     }
     // OAuth tokens have client_id starting with 'gbrain_cl_'; legacy
     // access_tokens reuse `name` as both clientId and clientName (verifyAccessToken
@@ -4687,6 +4785,8 @@ const recall: Operation = {
           limit,
           expansion: false,
           ...searchScope,
+          // Masked callers bypass the identity-agnostic query cache (identity-acl).
+          ...(hiddenSlugPrefixesFor(ctx) ? { useCache: false } : {}),
         });
       }
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
@@ -5562,10 +5662,13 @@ const schema_review_orphans: Operation = {
       params.push(scope.sourceId);
     }
     try {
-      const rows = await ctx.engine.executeRaw<{ slug: string; source_id: string }>(
+      const rawRows = await ctx.engine.executeRaw<{ slug: string; source_id: string }>(
         `SELECT slug, COALESCE(source_id, 'default') AS source_id FROM pages ${where} ORDER BY source_id, slug LIMIT ${limit}`,
         params,
       );
+      // identity-acl: this op reads via executeRaw, which bypasses the masked
+      // engine view — post-filter hidden slugs here (per-tool patch).
+      const rows = rawRows.filter((r) => !slugHiddenFromCaller(ctx, r.slug));
       return {
         schema_version: 1,
         orphan_count: rows.length,
@@ -6282,7 +6385,10 @@ const extraction_pending: Operation = {
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
-    return { count: rows.length, pending: rows };
+    // identity-acl: executeRaw bypasses the masked engine view — post-filter
+    // hidden slugs here (per-tool patch).
+    const visible = rows.filter((r) => !slugHiddenFromCaller(ctx, r.slug));
+    return { count: visible.length, pending: visible };
   },
   cliHints: { name: 'extraction-pending' },
 };

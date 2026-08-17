@@ -46,6 +46,7 @@ import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.
 import type { AuthInfo as SdkAuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseScopeString, assertAllowedScopes } from './scope.ts';
+import { assertValidSlugPrefixes } from './oauth-provider.ts';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -59,6 +60,16 @@ export interface EntraIdentityGrant {
   sourceId?: string;
   /** Optional federated read set — same axis as oauth_clients.federated_read. */
   federatedRead?: string[];
+  /**
+   * Slug-prefix WRITE fence — the same axis (and the same
+   * `assertValidSlugPrefixes` grammar + boundary-aware matcher) as
+   * `oauth_clients.bound_slug_prefixes`. When set and non-empty, every
+   * slug-mutating write by this identity must target a slug under one of
+   * these prefixes; it rides `AuthInfo.boundSlugPrefixes` so the existing
+   * `enforceClientSlugFence` / `enforceBoundClientOpAllowList` machinery
+   * applies unchanged. Absent/empty = unfenced (the owner case).
+   */
+  writePrefixes?: string[];
 }
 
 export interface EntraConfig {
@@ -85,6 +96,23 @@ export interface EntraConfig {
    * rejected. Fail-closed — set default_scopes explicitly to open up.
    */
   defaultScopes: string[];
+  /**
+   * Read-side ACL: slug prefix → invited identities (lowercased UPN or oid).
+   * Any page whose slug falls under a masked prefix is visible ONLY to
+   * identities on its invite list. Non-invited Entra identities must not be
+   * able to establish the page EXISTS: direct fetches behave exactly like a
+   * nonexistent slug, list/search surfaces simply omit it.
+   *
+   * EXEMPT (full visibility, by design): admin-scoped Entra identities,
+   * native OAuth clients, legacy bearer tokens, and the local CLI. Native /
+   * legacy tokens are owner-issued machine credentials; partners only ever
+   * get Entra sign-in, so masking is enforced on the Entra path alone.
+   *
+   * Prefix grammar and validation are identical to bound_slug_prefixes
+   * (`assertValidSlugPrefixes` + the boundary-aware matcher). Empty invite
+   * list = visible to exempt callers only.
+   */
+  maskedPrefixes: Map<string, string[]>;
 }
 
 /** File-plane shape (`entra` block in ~/.gbrain/config.json). */
@@ -97,18 +125,20 @@ export interface EntraFileConfig {
   accept_v1_issuer?: boolean;
   identity_map?: Record<string, EntraIdentityMapEntry>;
   default_scopes?: string[] | string;
+  /** Slug prefix → invited identities (UPN or oid). See EntraConfig.maskedPrefixes. */
+  masked_prefixes?: Record<string, string[]>;
 }
 
 /**
  * Accepted per-identity shapes in identity_map:
  *   "read write"                        — scope string
  *   ["read", "write"]                   — scope array
- *   { scopes, source_id, federated_read } — full grant object
+ *   { scopes, source_id, federated_read, write_prefixes } — full grant object
  */
 export type EntraIdentityMapEntry =
   | string
   | string[]
-  | { scopes: string | string[]; source_id?: string; federated_read?: string[] };
+  | { scopes: string | string[]; source_id?: string; federated_read?: string[]; write_prefixes?: string[] };
 
 function parseBoolEnv(v: string | undefined): boolean | undefined {
   if (v === undefined || v === '') return undefined;
@@ -133,11 +163,75 @@ function normalizeGrant(entry: EntraIdentityMapEntry, key: string): EntraIdentit
   if (typeof entry === 'string' || Array.isArray(entry)) {
     return { scopes: normalizeScopes(entry, `identity_map["${key}"]`) };
   }
+  let writePrefixes: string[] | undefined;
+  if (entry.write_prefixes !== undefined) {
+    if (!Array.isArray(entry.write_prefixes) || entry.write_prefixes.some(p => typeof p !== 'string')) {
+      throw new Error(`Entra config: identity_map["${key}"].write_prefixes must be an array of slug-prefix strings`);
+    }
+    // Empty array = "no fence configured" (the unfenced owner case), matching
+    // the spec'd absent/empty semantics — NOT bound_slug_prefixes' deny-all.
+    if (entry.write_prefixes.length > 0) {
+      try {
+        assertValidSlugPrefixes(entry.write_prefixes);
+      } catch (e) {
+        throw new Error(`Entra config: identity_map["${key}"].write_prefixes: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      writePrefixes = entry.write_prefixes;
+    }
+  }
   return {
     scopes: normalizeScopes(entry.scopes, `identity_map["${key}"]`),
     ...(entry.source_id ? { sourceId: entry.source_id } : {}),
     ...(entry.federated_read ? { federatedRead: entry.federated_read } : {}),
+    ...(writePrefixes ? { writePrefixes } : {}),
   };
+}
+
+/**
+ * Normalize + validate the masked_prefixes ACL map. Prefixes must satisfy the
+ * same registration grammar as bound_slug_prefixes (non-empty, lowercase,
+ * trailing "/" or "/*" boundary); invitees are lowercased so matching against
+ * `preferred_username` / `oid` is case-insensitive, mirroring identityMap.
+ */
+function normalizeMaskedPrefixes(
+  raw: Record<string, string[]> | undefined,
+): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  if (!raw) return out;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('Entra config: masked_prefixes must be an object mapping slug prefix → array of invited identities');
+  }
+  for (const [prefix, invitees] of Object.entries(raw)) {
+    try {
+      assertValidSlugPrefixes([prefix]);
+    } catch (e) {
+      throw new Error(`Entra config: masked_prefixes key "${prefix}": ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (!Array.isArray(invitees) || invitees.some(i => typeof i !== 'string' || i.trim() === '')) {
+      throw new Error(`Entra config: masked_prefixes["${prefix}"] must be an array of non-empty identity strings (UPN or oid)`);
+    }
+    out.set(prefix, invitees.map(i => i.toLowerCase()));
+  }
+  return out;
+}
+
+/**
+ * The masked prefixes THIS identity may NOT see: every masked prefix whose
+ * invite list contains neither the caller's UPN nor oid. Callers are expected
+ * to pass lowercased identifiers (verifyEntraToken does).
+ */
+export function hiddenMaskedPrefixes(
+  cfg: Pick<EntraConfig, 'maskedPrefixes'>,
+  identity: { upn?: string; oid?: string },
+): string[] {
+  const hidden: string[] = [];
+  for (const [prefix, invitees] of cfg.maskedPrefixes) {
+    const invited =
+      (identity.upn !== undefined && invitees.includes(identity.upn)) ||
+      (identity.oid !== undefined && invitees.includes(identity.oid));
+    if (!invited) hidden.push(prefix);
+  }
+  return hidden;
 }
 
 /**
@@ -194,7 +288,20 @@ export function resolveEntraConfig(
     'default_scopes',
   );
 
-  return { tenantId, clientId, clientSecret, apiScope, acceptV1Issuer, identityMap, defaultScopes };
+  // Env value replaces the file map wholesale (same posture as IDENTITY_MAP).
+  let rawMasked: Record<string, string[]> | undefined = fileEntra?.masked_prefixes;
+  if (env.GBRAIN_ENTRA_MASKED_PREFIXES) {
+    try {
+      rawMasked = JSON.parse(env.GBRAIN_ENTRA_MASKED_PREFIXES) as Record<string, string[]>;
+    } catch (e) {
+      throw new Error(
+        `Entra config: GBRAIN_ENTRA_MASKED_PREFIXES is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+  const maskedPrefixes = normalizeMaskedPrefixes(rawMasked);
+
+  return { tenantId, clientId, clientSecret, apiScope, acceptV1Issuer, identityMap, defaultScopes, maskedPrefixes };
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +535,20 @@ export async function verifyEntraToken(
   const name = typeof payload.name === 'string' ? payload.name : undefined;
   const tid = typeof payload.tid === 'string' ? payload.tid : undefined;
 
+  // Per-identity ACL threading (docs/entra-auth.md → "Identity ACL"):
+  //  - write_prefixes ride AuthInfo.boundSlugPrefixes so the EXISTING
+  //    bound_slug_prefixes write fence (enforceClientSlugFence + the
+  //    dispatch-level op allow-list) applies to Entra identities unchanged.
+  //  - hiddenSlugPrefixes = the masked prefixes this identity is NOT invited
+  //    to. Admin-scoped identities are EXEMPT (full visibility) — masking
+  //    exists to subset partner reads, and only the owner holds admin.
+  //    Native OAuth / legacy tokens never pass through this function, so
+  //    they are exempt by construction.
+  const isAdmin = grant.scopes.includes('admin');
+  const hidden = isAdmin
+    ? []
+    : hiddenMaskedPrefixes(cfg, { upn: upn?.toLowerCase(), oid: oid?.toLowerCase() });
+
   return {
     token,
     clientId: `entra:${oid ?? upn ?? 'unknown'}`,
@@ -436,6 +557,10 @@ export async function verifyEntraToken(
     expiresAt: typeof payload.exp === 'number' ? payload.exp : 0,
     ...(grant.sourceId ? { sourceId: grant.sourceId } : {}),
     ...(grant.federatedRead ? { allowedSources: grant.federatedRead } : {}),
+    ...(grant.writePrefixes && grant.writePrefixes.length > 0
+      ? { boundSlugPrefixes: grant.writePrefixes }
+      : {}),
+    ...(hidden.length > 0 ? { hiddenSlugPrefixes: hidden } : {}),
     entra: {
       oid: oid ?? '',
       ...(upn ? { preferredUsername: upn } : {}),

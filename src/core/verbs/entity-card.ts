@@ -24,6 +24,7 @@ import { normalizeAlias } from '../search/alias-normalize.ts';
 import { slugify } from '../entities/resolve.ts';
 import { safeSynopsis } from '../context/retrieval-reflex.ts';
 import { stampEvidence } from '../search/evidence.ts';
+import { isSlugHidden } from '../read-mask.ts';
 import type { SearchResult } from '../types.ts';
 
 const EDGE_CAP = 10;
@@ -100,8 +101,22 @@ export async function buildEntityCard(
   engine: BrainEngine,
   sourceId: string,
   name: string,
-  opts: { remote: boolean },
+  opts: {
+    remote: boolean;
+    /**
+     * identity-acl read mask: slug prefixes the caller may not see. The
+     * engine-level mask covers this card's typed reads (resolveAliases,
+     * getLinks, searchKeyword), but the raw-SQL arms (`engine.executeRaw`
+     * on pages/links) bypass it — this option is the per-tool patch that
+     * keeps hidden entities resolving as found:false and keeps hidden
+     * neighbors out of incoming edges.
+     */
+    hiddenSlugPrefixes?: string[];
+  },
 ): Promise<EntityCardResult> {
+  const hiddenPrefixes = opts.hiddenSlugPrefixes ?? [];
+  const isHidden = (s: string | null | undefined): boolean =>
+    hiddenPrefixes.length > 0 && typeof s === 'string' && s.length > 0 && isSlugHidden(hiddenPrefixes, s);
   const trimmed = (name ?? '').trim();
   if (!trimmed) return { found: false, suggestions: [] };
 
@@ -148,6 +163,8 @@ export async function buildEntityCard(
   } catch {
     rows = [];
   }
+  // identity-acl per-tool patch: raw-SQL arm bypasses the engine mask.
+  if (hiddenPrefixes.length > 0) rows = rows.filter(r => !isHidden(r.slug));
   const rowBySlug = new Map<string, CardPageRow>();
   for (const r of rows) {
     rowBySlug.set(r.slug, r);
@@ -165,7 +182,9 @@ export async function buildEntityCard(
           WHERE deleted_at IS NULL AND source_id = $1 AND slug = ANY($2::text[])`,
         [sourceId, missing],
       );
-      for (const r of extra) rowBySlug.set(r.slug, r);
+      for (const r of extra) {
+        if (!isHidden(r.slug)) rowBySlug.set(r.slug, r); // identity-acl: raw-SQL bypass
+      }
     } catch {
       /* stale alias rows — drop */
     }
@@ -189,7 +208,7 @@ export async function buildEntityCard(
     create_safety: 'exists',
   }));
 
-  const card = await assembleCard(engine, sourceId, best.row, opts.remote);
+  const card = await assembleCard(engine, sourceId, best.row, opts.remote, isHidden);
   return {
     found: true,
     card,
@@ -202,6 +221,7 @@ async function assembleCard(
   sourceId: string,
   row: CardPageRow,
   remote: boolean,
+  isHidden: (s: string | null | undefined) => boolean = () => false,
 ): Promise<EntityCard> {
   const pageSlug = row.slug;
   const visibility = remote ? (['world'] as ('private' | 'world')[]) : undefined;
@@ -259,14 +279,23 @@ async function assembleCard(
       .catch(() => [] as FactRow[]),
   ]);
 
+  // identity-acl per-tool patch: the incoming-edge + backlink-count arms are
+  // raw SQL (engine-mask bypass) — scrub hidden neighbors and recount from
+  // the (uncapped) filtered edge list so the count cannot reveal them.
+  const visibleInEdges = inEdges.filter(l => !isHidden(l.from_slug));
+  const visibleBacklinkCount = visibleInEdges.length === inEdges.length
+    ? backlinkCount
+    : visibleInEdges.length;
+
   const edges: EntityCardEdge[] = [];
   for (const l of outLinks) {
     if (l.link_source === 'mentions') continue;
+    if (isHidden(l.to_slug)) continue; // belt-and-braces; getLinks is engine-masked
     edges.push({ type: l.link_type, direction: 'out', slug: l.to_slug, context: l.context || null });
     if (edges.length >= EDGE_CAP) break;
   }
   if (edges.length < EDGE_CAP) {
-    for (const l of inEdges) {
+    for (const l of visibleInEdges) {
       edges.push({ type: l.link_type, direction: 'in', slug: l.from_slug, context: l.context || null });
       if (edges.length >= EDGE_CAP) break;
     }
@@ -301,7 +330,7 @@ async function assembleCard(
     },
     open_threads: openThreads,
     edges,
-    backlink_count: backlinkCount,
+    backlink_count: visibleBacklinkCount,
     active_fact_count: facts.length,
   };
 }
