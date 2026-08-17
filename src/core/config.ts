@@ -375,6 +375,33 @@ export interface GBrainConfig {
   };
 
   /**
+   * Microsoft Entra ID (Azure AD) JWT auth for `gbrain serve --http`
+   * (src/core/entra-auth.ts). When enabled, the server verifies
+   * Entra-issued JWTs against the tenant JWKS, maps verified identities
+   * (UPN / oid) to gbrain scopes, and serves a DCR-shim proxy so MCP
+   * clients (claude.ai, Claude Code) can sign in through Entra. Native
+   * OAuth tokens keep working alongside — both auth paths live
+   * simultaneously during migration.
+   *
+   * File-plane block; every field has a GBRAIN_ENTRA_* env override that
+   * wins (see `resolveEntraConfig`). Full reference: docs/entra-auth.md.
+   */
+  entra?: {
+    enabled?: boolean;
+    tenant_id?: string;
+    client_id?: string;
+    client_secret?: string;
+    /** Default: `api://<client_id>/access`. */
+    api_scope?: string;
+    /** Transition aid — also accept v1-issuer tokens. Default false. */
+    accept_v1_issuer?: boolean;
+    /** UPN-or-oid → scopes (string, array, or {scopes, source_id, federated_read}). */
+    identity_map?: Record<string, string | string[] | { scopes: string | string[]; source_id?: string; federated_read?: string[] }>;
+    /** Grant for unmapped tenant identities. Default [] = deny. */
+    default_scopes?: string[] | string;
+  };
+
+  /**
    * v0.38 — active schema pack name (D13 tier 6 in the 7-tier resolution
    * chain). The pack drives type inference, alias closure for search,
    * link-verb regexes, expert-routing flags, and enrichment dispatch.

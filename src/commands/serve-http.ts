@@ -28,6 +28,19 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
+import {
+  resolveEntraConfig,
+  EntraTokenVerifier,
+  createEntraAwareVerifier,
+  buildAuthServerMetadata,
+  buildProtectedResourceMetadata,
+  buildRegisterResponse,
+  sanitizeAuthorizeParams,
+  sanitizeTokenForm,
+  entraAuthorizeEndpoint,
+  entraTokenEndpoint,
+  type EntraConfig,
+} from '../core/entra-auth.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
@@ -709,6 +722,41 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     allowClientCredentialsDcr: enableDcrInsecure === true,
   });
 
+  // Entra JWT auth (src/core/entra-auth.ts). Resolution is fail-loud: an
+  // operator who enabled Entra but left the config incomplete gets a refusal
+  // to start, not a silent fall-through to native-only auth. When enabled,
+  // bearerVerifier routes JWT bearer tokens to Entra verification and
+  // everything else to the existing oauthProvider path UNCHANGED — both auth
+  // paths live simultaneously so native/legacy tokens keep working during
+  // migration. Rollback: GBRAIN_ENTRA_ENABLED=0 (or drop the entra config)
+  // returns the server to native-only auth.
+  let entraConfig: EntraConfig | null = null;
+  try {
+    entraConfig = resolveEntraConfig(config.entra);
+  } catch (e) {
+    console.error(`[serve-http] ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  const bearerVerifier = entraConfig
+    ? createEntraAwareVerifier(new EntraTokenVerifier(entraConfig), oauthProvider)
+    : oauthProvider;
+  if (entraConfig) {
+    console.error(
+      `[serve-http] Entra auth ENABLED (tenant ${entraConfig.tenantId}). ` +
+      `OAuth discovery now advertises the Entra DCR shim; native + legacy tokens still verify. ` +
+      `Mapped identities: ${entraConfig.identityMap.size}; unmapped default: ` +
+      `${entraConfig.defaultScopes.length > 0 ? entraConfig.defaultScopes.join(' ') : 'DENY'}` +
+      `${entraConfig.acceptV1Issuer ? '; accept_v1_issuer ON (transition aid — set requestedAccessTokenVersion: 2 on the app and turn this off)' : ''}.`,
+    );
+    if (!publicUrl) {
+      console.error(
+        '[serve-http] WARNING: Entra auth is enabled but --public-url is not set. ' +
+        'Discovery metadata will advertise localhost; remote MCP clients (claude.ai) need the public https origin. ' +
+        'Note claude.ai can only reach port 443 — front this server with a reverse proxy on 443.',
+      );
+    }
+  }
+
   // #1353: loud stderr security WARN when DCR is enabled. DCR is an
   // unauthenticated network registration endpoint; surface the posture change
   // (and the extra blast radius of --enable-dcr-insecure) so it's visible in
@@ -845,6 +893,85 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     legacyHeaders: false,
     message: 'Too many magic-link attempts. Wait a minute before trying again.',
   });
+
+  // ---------------------------------------------------------------------------
+  // Entra DCR shim (config-gated). Registered BEFORE mcpAuthRouter so these
+  // routes win Express's first-match dispatch: when Entra is enabled the
+  // discovery surface (/.well-known/*) advertises the shim, while the SDK
+  // router's native /authorize, /token, /register endpoints stay mounted and
+  // functional for already-provisioned native clients. The shim's own
+  // endpoints live under /oauth/* — no path collision with the SDK router.
+  //
+  // Spike findings carried here (full rationale in src/core/entra-auth.ts):
+  //   - authorize forwards ONLY the whitelist params + server-injected
+  //     client_id/scope; token strips `resource` and injects the secret
+  //     (Entra v2 rejects RFC 8707 `resource` — AADSTS9010010).
+  //   - both the bare and path-suffixed well-known forms are probed by
+  //     clients (/.well-known/oauth-authorization-server/mcp etc.).
+  // ---------------------------------------------------------------------------
+  if (entraConfig) {
+    const entra = entraConfig;
+    app.use('/oauth', cors(corsOAuthOptions));
+    const entraOrigin = (publicUrl || `http://localhost:${port}`).replace(/\/$/, '');
+
+    // Discovery metadata is public — allow-all CORS, matching the posture the
+    // SDK's own metadataHandler uses for the native well-known routes.
+    for (const p of [
+      '/.well-known/oauth-authorization-server',
+      '/.well-known/oauth-authorization-server/{*path}',
+      '/.well-known/openid-configuration',
+      '/.well-known/openid-configuration/{*path}',
+    ]) {
+      app.get(p, cors(), (_req: Request, res: Response) => {
+        res.json(buildAuthServerMetadata(entraOrigin, entra));
+      });
+    }
+    for (const p of [
+      '/.well-known/oauth-protected-resource',
+      '/.well-known/oauth-protected-resource/{*path}',
+    ]) {
+      app.get(p, cors(), (_req: Request, res: Response) => {
+        res.json(buildProtectedResourceMetadata(entraOrigin, entra));
+      });
+    }
+
+    // Fake DCR: every registrant is handed the ONE configured Entra client_id
+    // (public/PKCE — the real secret never leaves the token proxy below).
+    app.post('/oauth/register', express.json(), (req: Request, res: Response) => {
+      res.status(201).json(buildRegisterResponse(entra, req.body as Record<string, unknown> | undefined));
+    });
+
+    // Authorize proxy: 302 to Entra with the SANITIZED param set.
+    app.get('/oauth/authorize', (req: Request, res: Response) => {
+      const incoming = new URLSearchParams(req.originalUrl.split('?')[1] ?? '');
+      const q = sanitizeAuthorizeParams(incoming, entra);
+      res.redirect(302, `${entraAuthorizeEndpoint(entra)}?${q.toString()}`);
+    });
+
+    // Token proxy: strip `resource`, inject client_id + client_secret, inject
+    // scope on bare refresh_token grants, return Entra's response verbatim
+    // (status + body).
+    app.post('/oauth/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
+      try {
+        const incoming = new URLSearchParams();
+        for (const [k, v] of Object.entries((req.body ?? {}) as Record<string, unknown>)) {
+          if (typeof v === 'string') incoming.set(k, v);
+        }
+        const form = sanitizeTokenForm(incoming, entra);
+        const upstream = await fetch(entraTokenEndpoint(entra), {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded' },
+          body: form,
+        });
+        const body = await upstream.text();
+        res.status(upstream.status).type('application/json').send(body);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error('[serve-http] Entra token proxy error:', msg);
+        res.status(502).json({ error: 'entra_proxy_error', error_description: msg });
+      }
+    });
+  }
 
   app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
     if (req.body?.grant_type !== 'client_credentials') {
@@ -1885,7 +2012,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  app.post('/mcp', requireBearerAuth({ verifier: bearerVerifier, resourceMetadataUrl }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
@@ -2239,7 +2366,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.post(
     '/ingest',
     ingestRateLimiter,
-    requireBearerAuth({ verifier: oauthProvider, requiredScopes: ['write'], resourceMetadataUrl }),
+    requireBearerAuth({ verifier: bearerVerifier, requiredScopes: ['write'], resourceMetadataUrl }),
     express.raw({ type: '*/*', limit: ingestMaxBytes }),
     async (req: Request, res: Response) => {
       const startTime = Date.now();

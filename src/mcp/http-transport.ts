@@ -36,6 +36,8 @@ import { filterOpsForSurface } from './surface.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions } from '../core/legacy-token-scope.ts';
+import { loadConfig } from '../core/config.ts';
+import { resolveEntraConfig, looksLikeJwt, EntraTokenVerifier } from '../core/entra-auth.ts';
 export { parseLegacyTokenScope };
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
@@ -160,6 +162,12 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   // path works on either engine without a postgres.js singleton.
   const sql = sqlQueryForEngine(engine);
 
+  // Entra JWT auth (config-gated; null = disabled = zero behavior change).
+  // resolveEntraConfig throws when enabled-but-incomplete — fail loud at
+  // startup rather than silently serving native-only auth.
+  const entraCfg = resolveEntraConfig(loadConfig()?.entra);
+  const entraVerifier = entraCfg ? new EntraTokenVerifier(entraCfg) : null;
+
   const limiters = opts.limiters || buildDefaultLimiters();
   const bodyCap = envInt('GBRAIN_HTTP_MAX_BODY_BYTES', DEFAULT_BODY_CAP);
   const corsAllowlist = parseCorsAllowlist();
@@ -209,6 +217,28 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   async function validateToken(authHeader: string | null): Promise<AuthResult> {
     if (!authHeader?.startsWith('Bearer ')) return { ok: false };
     const token = authHeader.slice(7);
+    // Entra branch (src/core/entra-auth.ts): a JWT bearer token verifies
+    // against the tenant JWKS + identity map. Non-JWT tokens (the legacy
+    // access_tokens path this transport exists for) fall through UNCHANGED.
+    if (entraVerifier && looksLikeJwt(token)) {
+      try {
+        const auth = await entraVerifier.verifyAccessToken(token);
+        return {
+          ok: true,
+          tokenId: auth.clientId,
+          tokenName: auth.clientName ?? auth.clientId,
+          takesHoldersAllowList: ['world'],
+          sourceId: auth.sourceId ?? 'default',
+          auth,
+          // Mapped identities with an explicit source binding behave like
+          // operator-granted tokens; unbound ones keep the historical
+          // 'default'-floor read widening (#3242 semantics).
+          hasSourceGrant: auth.sourceId != null,
+        };
+      } catch {
+        return { ok: false };
+      }
+    }
     const hash = hashToken(token);
     try {
       const [row] = await sql`
