@@ -561,6 +561,16 @@ export interface AuthInfo {
    * unaffected — this axis alone fails closed.
    */
   fenceProjectionDegraded?: boolean;
+  /**
+   * Entra JWT auth (src/core/entra-auth.ts): the verified Microsoft Entra ID
+   * identity claims when the presented bearer token was an Entra-issued JWT.
+   * `oid` is the tenant-stable object id; `preferredUsername` is the UPN.
+   * The same identity is also surfaced through `clientId` (`entra:<oid>`)
+   * and `clientName` (UPN) so the existing audit/authorship path
+   * (mcp_request_log token_name / agent_name) stamps the verified person
+   * without any consumer changes. Undefined on every non-Entra path.
+   */
+  entra?: { oid: string; preferredUsername?: string; name?: string; tid?: string };
 }
 
 export interface OperationContext {
