@@ -35,6 +35,7 @@ silent fall-through to native-only auth.
 | `GBRAIN_ENTRA_ACCEPT_V1_ISSUER` | `accept_v1_issuer` | no | Default `false`. Transition aid only — see finding 3 below |
 | `GBRAIN_ENTRA_IDENTITY_MAP` | `identity_map` | no | JSON: identity → grant (see below). Env value replaces the file map wholesale |
 | `GBRAIN_ENTRA_DEFAULT_SCOPES` | `default_scopes` | no | Grant for tenant identities NOT in the map. Default empty = **DENY** |
+| `GBRAIN_ENTRA_MASKED_PREFIXES` | `masked_prefixes` | no | JSON: slug prefix → invited identities (see Identity ACL below). Env value replaces the file map wholesale |
 
 ### Identity → permission mapping
 
@@ -54,7 +55,8 @@ Keys are matched case-insensitively against the token's `preferred_username`
       "00000000-oid-guid": {                               // full grant object
         "scopes": "read write",
         "source_id": "wiki",                               // write-source binding
-        "federated_read": ["wiki", "default"]              // read set
+        "federated_read": ["wiki", "default"],             // read set
+        "write_prefixes": ["partners/carol/"]              // slug write fence (see Identity ACL)
       }
     },
     "default_scopes": []                                    // unmapped ⇒ deny
@@ -75,6 +77,144 @@ literal `write` scope (the SDK middleware does exact-match), so grant
 row in `mcp_request_log` (`token_name` / `agent_name`) and the `whoami` op
 stamp the actual person. Raw claims (`oid`, `preferred_username`, `name`,
 `tid`) also ride on `AuthInfo.entra` for future consumers.
+
+## Identity ACL — read masking + write fencing
+
+Two per-identity controls layer on top of the scope grants. Both reuse the
+`bound_slug_prefixes` machinery — the same prefix grammar (non-empty,
+lowercase, trailing `/` or `/*`), the same `assertValidSlugPrefixes`
+validation at startup, and the same boundary-aware matcher
+(`slugUnderBoundPrefixes`) — so one prefix means one thing everywhere.
+
+### `write_prefixes` — per-identity write fence
+
+An identity-map grant object may carry `write_prefixes: string[]`. When set
+and non-empty, every slug-mutating write by that identity must target a slug
+under one of the prefixes. This rides `AuthInfo.boundSlugPrefixes`, so
+enforcement is the EXISTING OAuth-client fence, unchanged:
+
+- The allow-listed write ops (`put_page`, `delete_page`, `restore_page`,
+  `add_tag`/`remove_tag`, `add_link`/`remove_link`, `add_timeline_entry`,
+  `revert_version`, `put_raw_data`, `think`, `submit_agent`) reject
+  out-of-prefix slugs with a `permission_denied` scope error — a fence, not
+  a mask; the error is plain and names the slug.
+- Every OTHER non-read op (`log_ingest`, `remember`/`forget`,
+  `extract_*`, …) is denied outright at dispatch
+  (`enforceBoundClientOpAllowList`) — those ops cannot be prefix-fenced, so
+  fenced identities lose them entirely rather than gaining a hole. This is
+  deliberately stricter than a per-slug check for the memory verbs.
+- `POST /ingest` is refused for fenced (and masked) identities for the same
+  reason it is refused for slug-bound OAuth clients.
+
+Absent or `[]` = unfenced (the owner case; scopes still apply).
+
+### `masked_prefixes` — read subsets with existence hiding
+
+Top-level `entra.masked_prefixes` maps a slug prefix to the identities
+(lowercased UPN or oid, matched case-insensitively) invited to see it:
+
+```jsonc
+{
+  "entra": {
+    "masked_prefixes": {
+      "restricted/":        ["owner@acme-example.com", "9ed97177-0000-0000-0000-000000000000"],
+      "restricted/case-x/": ["partner-c@acme-example.com"]
+    }
+  }
+}
+```
+
+At token-verification time the server computes the set of masked prefixes
+the caller is NOT invited to and threads it as
+`AuthInfo.hiddenSlugPrefixes`. The shared dispatch layer
+(`buildOperationContext` in `src/mcp/dispatch.ts`) then swaps the op
+context's engine for a masked read view (`src/core/read-mask.ts`) in which
+those pages **do not exist**:
+
+- A direct fetch of a masked slug (`get_page`, `get_chunks`, `get_tags`,
+  `get_timeline`, `get_links`/`get_backlinks`, `get_versions`,
+  `get_raw_data`, `traverse_graph`, …) produces the **byte-identical
+  response** a truly nonexistent slug produces — same error code, same
+  message. Never a 403 that admits existence.
+- List/search/graph/chronicle surfaces (`search`, `query`, `recall`,
+  `list_pages`, `resolve_slugs`, `entity`, `synthesize` retrieval,
+  `chronicle_*`, `get_recent_salience`, `find_*`, `takes_*`,
+  `get_ingest_log`, backlinks of visible pages, alias resolution, graph
+  traversal) simply omit masked pages, and edges/rows that would name one.
+- Masked callers bypass the query cache in both directions (cache rows are
+  not identity-keyed).
+- Writes into a masked prefix require BOTH an invite and (if fenced) a
+  covering write prefix — you can't write where you can't see. The
+  rejection reads like an ordinary write-grant error and never says "masked".
+
+**Exemptions (full visibility, by design):** the local CLI, native OAuth
+clients, legacy bearer tokens, and **admin-scoped Entra identities**.
+Native/legacy tokens are owner-issued machine credentials; partners only
+ever get Entra sign-in, so the Entra path is the enforcement surface.
+`whoami` reports `masked_areas_hidden: true|false` for Entra callers —
+a boolean only, never the prefix names.
+
+### Admin discipline
+
+Only the owner should hold `admin` (admin is exempt from masking and from
+the write fence gate). The startup banner prints how many mapped identities
+hold admin (`N with admin`) plus the masked-prefix count, and warns loudly
+if `default_scopes` grants admin to every tenant identity.
+
+### BUILD-style deployment example
+
+Partners read the whole brain except `restricted/`, write only their own
+folder; only the owner holds admin:
+
+```bash
+GBRAIN_ENTRA_IDENTITY_MAP='{
+  "owner@example.com": "read write admin",
+  "partner-a@example.com": {"scopes": "read write", "write_prefixes": ["partners/partner-a/"]},
+  "partner-b@example.com": {"scopes": "read write", "write_prefixes": ["partners/partner-b/"]}
+}'
+GBRAIN_ENTRA_MASKED_PREFIXES='{"restricted/": ["owner@example.com"]}'
+```
+
+(The owner's admin scope already exempts them from masking; listing them as
+an invitee is belt-and-braces for the day the scope changes.)
+
+### Known limits and caveats (read before relying on the mask)
+
+- **Masking is Entra-path only.** Anyone holding a native OAuth or legacy
+  bearer token sees everything. Do not hand those tokens to partners.
+- **Aggregate counts other than page/chunk stats are not adjusted.**
+  `get_stats`/`get_health` are admin-scoped (masked identities cannot call
+  them; admins are exempt), and the masked engine view additionally
+  subtracts hidden pages/chunks as defense in depth — but
+  `list_link_sources` provenance counts, anomaly cohort statistics, takes
+  scorecard/calibration aggregates, and backlink-count boosts inside search
+  ranking are computed over the full corpus. These reveal at most that
+  *some* number changed, never a slug or content.
+- **Derived content is only masked where it carries a slug.** A fact row
+  extracted from a masked page whose `entity_slug` points at a VISIBLE
+  entity remains visible (the fact text itself may paraphrase masked
+  content). Keep extraction off for masked trees, or accept this.
+- **`getLastSeen` redacts a masked most-recent event's slug but keeps the
+  date** — the date alone names no page.
+- **Result lists may run short.** Post-filtering happens after SQL LIMIT,
+  so a page of results can contain fewer rows than `limit`. This is plain
+  omission, not a distinguishable marker.
+- **No timing guarantees.** Masked direct fetches short-circuit before the
+  DB read; a timing oracle could in principle distinguish them. Spec'd as
+  acceptable (no *cheaply avoidable* timing shortcuts beyond this).
+- **Write probes can reveal that a masked PREFIX exists (never its pages).**
+  The masked-write fence rejects by prefix, uniformly, whether or not any
+  page exists under the probed slug — so an identity holding `write` scope
+  and no `write_prefixes` (unusual for partners) could notice that writes
+  under `restricted/` fail while writes elsewhere succeed. Individual page
+  existence and content stay hidden. Fenced partners can't run this probe:
+  every out-of-prefix write fails identically.
+- **Engine methods not on the mask's intercept table pass through.** All
+  read surfaces reachable over remote MCP are covered (see the table in
+  `src/core/read-mask.ts`); ops that read via `executeRaw`
+  (`extraction_pending`, `schema_review_orphans`, the `entity` card's raw
+  arms) carry their own per-tool filters. A NEW op that reads raw SQL must
+  add its own filter — grep for `slugHiddenFromCaller`.
 
 ## Entra app registration requirements
 

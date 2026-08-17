@@ -32,6 +32,7 @@ import {
   EntraTokenVerifier,
   createEntraAwareVerifier,
   entraScopes,
+  hiddenMaskedPrefixes,
   type EntraConfig,
 } from '../src/core/entra-auth.ts';
 
@@ -52,6 +53,7 @@ function mkConfig(overrides: Partial<EntraConfig> = {}): EntraConfig {
       ['oid-charlie', { scopes: ['read'], sourceId: 'wiki', federatedRead: ['wiki', 'default'] }],
     ]),
     defaultScopes: [],
+    maskedPrefixes: new Map<string, string[]>(),
     ...overrides,
   };
 }
@@ -152,6 +154,94 @@ describe('resolveEntraConfig', () => {
     expect(resolveEntraConfig({ ...base, accept_v1_issuer: true }, {})!.acceptV1Issuer).toBe(true);
     expect(resolveEntraConfig({ ...base, accept_v1_issuer: true }, { GBRAIN_ENTRA_ACCEPT_V1_ISSUER: '0' })!.acceptV1Issuer).toBe(false);
     expect(resolveEntraConfig(base, { GBRAIN_ENTRA_ACCEPT_V1_ISSUER: 'true' })!.acceptV1Issuer).toBe(true);
+  });
+
+  // ── identity-acl: write_prefixes + masked_prefixes config plane ──────────
+
+  test('write_prefixes: validated with the bound_slug_prefixes grammar; empty array = unfenced', () => {
+    const base = { enabled: true, tenant_id: TENANT, client_id: CLIENT, client_secret: 'x' };
+    const cfg = resolveEntraConfig({
+      ...base,
+      identity_map: {
+        'alice@acme-example.com': { scopes: 'read write', write_prefixes: ['partners/alice/'] },
+        'owner@acme-example.com': { scopes: 'read write admin', write_prefixes: [] },
+      },
+    }, {});
+    expect(cfg!.identityMap.get('alice@acme-example.com')!.writePrefixes).toEqual(['partners/alice/']);
+    expect(cfg!.identityMap.get('owner@acme-example.com')!.writePrefixes).toBeUndefined();
+  });
+
+  test('write_prefixes: boundary-less / mixed-case / empty-string entries rejected at startup', () => {
+    const base = { enabled: true, tenant_id: TENANT, client_id: CLIENT, client_secret: 'x' };
+    const mk = (write_prefixes: unknown) => () => resolveEntraConfig({
+      ...base,
+      identity_map: { 'a@b.c': { scopes: 'read write', write_prefixes: write_prefixes as string[] } },
+    }, {});
+    expect(mk(['partners/alice'])).toThrow(/must end with/);
+    expect(mk(['Partners/Alice/'])).toThrow(/lowercase/);
+    expect(mk([''])).toThrow(/non-empty/);
+    expect(mk('partners/alice/')).toThrow(/array/);
+  });
+
+  test('masked_prefixes: parsed, prefixes validated, invitees lowercased', () => {
+    const base = { enabled: true, tenant_id: TENANT, client_id: CLIENT, client_secret: 'x' };
+    const cfg = resolveEntraConfig({
+      ...base,
+      masked_prefixes: {
+        'restricted/': ['Owner@Acme-Example.com', 'OID-BOB'],
+        'restricted/case-x/': [],
+      },
+    }, {});
+    expect(cfg!.maskedPrefixes.get('restricted/')).toEqual(['owner@acme-example.com', 'oid-bob']);
+    expect(cfg!.maskedPrefixes.get('restricted/case-x/')).toEqual([]);
+  });
+
+  test('masked_prefixes: invalid prefix or invitee shape → loud startup failure', () => {
+    const base = { enabled: true, tenant_id: TENANT, client_id: CLIENT, client_secret: 'x' };
+    expect(() => resolveEntraConfig({ ...base, masked_prefixes: { restricted: ['a@b.c'] } }, {}))
+      .toThrow(/must end with/);
+    expect(() => resolveEntraConfig({ ...base, masked_prefixes: { 'restricted/': ['a@b.c', ''] } }, {}))
+      .toThrow(/non-empty identity/);
+    expect(() => resolveEntraConfig({ ...base, masked_prefixes: { 'restricted/': 'a@b.c' as unknown as string[] } }, {}))
+      .toThrow(/array/);
+  });
+
+  test('GBRAIN_ENTRA_MASKED_PREFIXES env JSON replaces the file map wholesale; bad JSON throws', () => {
+    const base = { enabled: true, tenant_id: TENANT, client_id: CLIENT, client_secret: 'x' };
+    const cfg = resolveEntraConfig(
+      { ...base, masked_prefixes: { 'file-only/': ['a@b.c'] } },
+      { GBRAIN_ENTRA_MASKED_PREFIXES: JSON.stringify({ 'env-only/': ['b@c.d'] }) },
+    );
+    expect(cfg!.maskedPrefixes.has('file-only/')).toBe(false);
+    expect(cfg!.maskedPrefixes.get('env-only/')).toEqual(['b@c.d']);
+    expect(() => resolveEntraConfig(base, { GBRAIN_ENTRA_MASKED_PREFIXES: '{nope' }))
+      .toThrow(/not valid JSON/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// identity-acl: hidden-prefix computation (pure)
+// ---------------------------------------------------------------------------
+
+describe('hiddenMaskedPrefixes', () => {
+  const masked = new Map<string, string[]>([
+    ['restricted/', ['bob@acme-example.com', 'oid-eve']],
+    ['restricted/case-x/', ['bob@acme-example.com']],
+  ]);
+
+  test('non-invited identity hides every masked prefix', () => {
+    expect(hiddenMaskedPrefixes({ maskedPrefixes: masked }, { upn: 'alice@acme-example.com', oid: 'oid-alice' }))
+      .toEqual(['restricted/', 'restricted/case-x/']);
+  });
+
+  test('UPN invite reveals; oid invite reveals; partial invites stay partial', () => {
+    expect(hiddenMaskedPrefixes({ maskedPrefixes: masked }, { upn: 'bob@acme-example.com' })).toEqual([]);
+    expect(hiddenMaskedPrefixes({ maskedPrefixes: masked }, { oid: 'oid-eve' }))
+      .toEqual(['restricted/case-x/']);
+  });
+
+  test('no masked prefixes configured → nothing hidden', () => {
+    expect(hiddenMaskedPrefixes({ maskedPrefixes: new Map() }, { upn: 'x@y.z' })).toEqual([]);
   });
 });
 
@@ -408,6 +498,59 @@ describe('verifyEntraToken', () => {
     const token = await sign({ preferred_username: 'newhire@acme-example.com', oid: 'oid-new' });
     const auth = await verifyEntraToken(token, mkConfig({ defaultScopes: ['read'] }), publicKey);
     expect(auth.scopes).toEqual(['read']);
+  });
+
+  // ── identity-acl: grant → AuthInfo threading ─────────────────────────────
+
+  test('write_prefixes ride AuthInfo.boundSlugPrefixes (existing fence machinery applies)', async () => {
+    const cfg = mkConfig({
+      identityMap: new Map([
+        ['alice@acme-example.com', { scopes: ['read', 'write'], writePrefixes: ['partners/alice/'] }],
+      ]),
+    });
+    const auth = await verifyEntraToken(await sign(), cfg, publicKey);
+    expect(auth.boundSlugPrefixes).toEqual(['partners/alice/']);
+  });
+
+  test('non-invited identity gets hiddenSlugPrefixes; invited (UPN, case-insensitive) does not', async () => {
+    const cfg = mkConfig({
+      maskedPrefixes: new Map([['restricted/', ['bob@acme-example.com']]]),
+    });
+    const alice = await verifyEntraToken(await sign(), cfg, publicKey);
+    expect(alice.hiddenSlugPrefixes).toEqual(['restricted/']);
+
+    const cfgInvited = mkConfig({
+      maskedPrefixes: new Map([['restricted/', ['alice@acme-example.com']]]),
+    });
+    const invited = await verifyEntraToken(await sign(), cfgInvited, publicKey);
+    expect(invited.hiddenSlugPrefixes).toBeUndefined();
+  });
+
+  test('oid invite reveals too (case-insensitive)', async () => {
+    const cfg = mkConfig({
+      maskedPrefixes: new Map([['restricted/', ['oid-alice']]]),
+    });
+    const auth = await verifyEntraToken(await sign({ oid: 'OID-Alice' }), cfg, publicKey);
+    expect(auth.hiddenSlugPrefixes).toBeUndefined();
+  });
+
+  test('admin-scoped identities are EXEMPT from masking (full visibility)', async () => {
+    const cfg = mkConfig({
+      identityMap: new Map([['alice@acme-example.com', { scopes: ['read', 'write', 'admin'] }]]),
+      maskedPrefixes: new Map([['restricted/', ['bob@acme-example.com']]]),
+    });
+    const auth = await verifyEntraToken(await sign(), cfg, publicKey);
+    expect(auth.hiddenSlugPrefixes).toBeUndefined();
+  });
+
+  test('unmapped identity on default_scopes is still masked (non-invited)', async () => {
+    const cfg = mkConfig({
+      defaultScopes: ['read'],
+      maskedPrefixes: new Map([['restricted/', ['bob@acme-example.com']]]),
+    });
+    const token = await sign({ preferred_username: 'newhire@acme-example.com', oid: 'oid-new' });
+    const auth = await verifyEntraToken(token, cfg, publicKey);
+    expect(auth.hiddenSlugPrefixes).toEqual(['restricted/']);
   });
 
   test('tampered signature → InvalidTokenError', async () => {

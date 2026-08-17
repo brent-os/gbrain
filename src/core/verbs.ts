@@ -193,6 +193,11 @@ const entity: Operation = {
     const { buildEntityCard } = await import('./verbs/entity-card.ts');
     const result = await buildEntityCard(ctx.engine, ctx.sourceId ?? 'default', name, {
       remote: ctx.remote !== false,
+      // identity-acl: the card's raw-SQL arms bypass the engine-level read
+      // mask; thread the caller's hidden prefixes so the per-tool patch runs.
+      ...(ctx.auth?.hiddenSlugPrefixes?.length
+        ? { hiddenSlugPrefixes: ctx.auth.hiddenSlugPrefixes }
+        : {}),
     });
     return {
       protocol_version: MEMORY_VERBS_VERSION,

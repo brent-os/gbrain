@@ -741,11 +741,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     ? createEntraAwareVerifier(new EntraTokenVerifier(entraConfig), oauthProvider)
     : oauthProvider;
   if (entraConfig) {
+    // Admin discipline (identity-acl): print how many identities hold admin
+    // so an over-granted map is visible at every restart. Masking exempts
+    // admin identities entirely, so this number is the size of the
+    // full-visibility set. default_scopes granting admin would make every
+    // unmapped tenant user an admin — call that out loudly.
+    const adminCount = [...entraConfig.identityMap.values()]
+      .filter(g => g.scopes.includes('admin')).length;
+    const defaultGrantsAdmin = entraConfig.defaultScopes.includes('admin');
     console.error(
       `[serve-http] Entra auth ENABLED (tenant ${entraConfig.tenantId}). ` +
       `OAuth discovery now advertises the Entra DCR shim; native + legacy tokens still verify. ` +
-      `Mapped identities: ${entraConfig.identityMap.size}; unmapped default: ` +
+      `Mapped identities: ${entraConfig.identityMap.size} (${adminCount} with admin); unmapped default: ` +
       `${entraConfig.defaultScopes.length > 0 ? entraConfig.defaultScopes.join(' ') : 'DENY'}` +
+      `${defaultGrantsAdmin ? ' — WARNING: default_scopes grants admin to EVERY tenant identity' : ''}` +
+      `; masked prefixes: ${entraConfig.maskedPrefixes.size}` +
       `${entraConfig.acceptV1Issuer ? '; accept_v1_issuer ON (transition aid — set requestedAccessTokenVersion: 2 on the app and turn this off)' : ''}.`,
     );
     if (!publicUrl) {
@@ -2467,17 +2477,25 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // client's grant. These clients have put_page over MCP, which enforces
       // both the prefix fence and the source scope; webhook integrations use
       // unbound clients.
+      // identity-acl: masked identities (hiddenSlugPrefixes) are refused for
+      // the same reason as slug-bound clients — the ingest pipeline derives
+      // slugs outside any OperationContext, so neither the write fence nor
+      // the masked-write check can run on its output.
       const boundPrefixes = authInfo.boundSlugPrefixes;
-      if (boundPrefixes || authInfo.fenceProjectionDegraded) {
+      const maskedIdentity = (authInfo.hiddenSlugPrefixes?.length ?? 0) > 0;
+      if (boundPrefixes || maskedIdentity || authInfo.fenceProjectionDegraded) {
         res.status(403).json({
           error: 'permission_denied',
           message: authInfo.fenceProjectionDegraded
             ? 'POST /ingest is unavailable: this brain\'s oauth_clients projection is missing ' +
               'bound_slug_prefixes, so client write bindings cannot be evaluated. ' +
               'Run `gbrain apply-migrations --yes` on the brain host.'
-            : 'POST /ingest is not available to clients restricted to slug prefixes ' +
-              `(bound_slug_prefixes: ${boundPrefixes!.join(', ')}). Write through the MCP put_page op, ` +
-              'which enforces the prefix fence and your source scope.',
+            : boundPrefixes
+              ? 'POST /ingest is not available to clients restricted to slug prefixes ' +
+                `(bound_slug_prefixes: ${boundPrefixes.join(', ')}). Write through the MCP put_page op, ` +
+                'which enforces the prefix fence and your source scope.'
+              : 'POST /ingest is not available to this identity. Write through the MCP put_page op, ' +
+                'which enforces your write grant.',
         });
         return;
       }

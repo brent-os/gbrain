@@ -9,6 +9,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, enforceBoundClientOpAllowList } from '../core/operations.ts';
 import type { Operation, OperationContext, AuthInfo } from '../core/operations.ts';
+import { maskEngineForRead } from '../core/read-mask.ts';
 import { loadConfig } from '../core/config.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
 import { logVerbUsage } from '../core/verbs/usage-log.ts';
@@ -228,8 +229,17 @@ export function buildOperationContext(
   params: Record<string, unknown>,
   opts: DispatchOpts = {},
 ): OperationContext {
+  // Read-side masking (feature/identity-acl): when the verified identity
+  // carries hiddenSlugPrefixes (non-admin Entra identities not invited to
+  // one or more masked prefixes), every op handler sees a masked engine
+  // view in which those pages do not exist. This is the ONE context-build
+  // path both MCP transports share, so central enforcement lives here.
+  // Local CLI, native OAuth, legacy tokens, and admin identities never
+  // carry the field → raw engine, full visibility.
+  const hidden = opts.auth?.hiddenSlugPrefixes;
+  const effectiveEngine = hidden && hidden.length > 0 ? maskEngineForRead(engine, hidden) : engine;
   return {
-    engine,
+    engine: effectiveEngine,
     config: loadConfig() || { engine: 'postgres' },
     logger: opts.logger || stderrLogger,
     dryRun: !!params.dry_run,
