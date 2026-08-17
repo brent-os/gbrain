@@ -126,6 +126,107 @@ describe('whoami op contract', () => {
     expect(result.federated_read).toEqual(['canonical-brain']);
   });
 
+  // Entra JWT callers (v0.44.2.0 feature) have clientId 'entra:<oid>' — no
+  // 'gbrain_cl_' prefix — so before the ctx.auth.entra check (v0.44.3.0)
+  // they misfiled into the legacy branch as {transport: 'legacy',
+  // expires_at: null}, which cost a debugging session on 2026-08-16.
+  test('entra transport returns verified claims, live expiry, and grants', async () => {
+    const auth: AuthInfo = {
+      token: 'eyJ.entra.jwt',
+      clientId: 'entra:00000000-aaaa-bbbb-cccc-000000000001',
+      clientName: 'brent@buildcapitalpartners.com',
+      scopes: ['read', 'write', 'admin'],
+      expiresAt: 1786950000,
+      sourceId: 'default',
+      allowedSources: ['default'],
+      entra: {
+        oid: '00000000-aaaa-bbbb-cccc-000000000001',
+        preferredUsername: 'brent@buildcapitalpartners.com',
+        name: 'Brent Jacobsen',
+        tid: 'tenant-guid',
+      },
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result).toEqual({
+      transport: 'entra',
+      client_id: 'entra:00000000-aaaa-bbbb-cccc-000000000001',
+      upn: 'brent@buildcapitalpartners.com',
+      oid: '00000000-aaaa-bbbb-cccc-000000000001',
+      name: 'Brent Jacobsen',
+      scopes: ['read', 'write', 'admin'],
+      expires_at: 1786950000,
+      source_id: 'default',
+      federated_read: ['default'],
+      write_prefixes: [],
+      masked_areas_hidden: false,
+    });
+  });
+
+  test('entra transport is not mislabeled legacy (the v0.44.2.0 regression)', async () => {
+    const auth: AuthInfo = {
+      token: 'eyJ.entra.jwt',
+      clientId: 'entra:some-oid',
+      scopes: ['read'],
+      expiresAt: 1786950000,
+      entra: { oid: 'some-oid' },
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result.transport).toBe('entra');
+    // Live expiry survives — the legacy branch would null it.
+    expect(result.expires_at).toBe(1786950000);
+  });
+
+  test('entra transport fail-closed nulls for absent optional claims', async () => {
+    const auth: AuthInfo = {
+      token: 'eyJ.entra.jwt',
+      // verifyEntraToken emits oid '' when the claim is absent; whoami
+      // surfaces that as null rather than an empty string.
+      clientId: 'entra:user@example.com',
+      scopes: ['read'],
+      expiresAt: 1786950000,
+      entra: { oid: '', preferredUsername: 'user@example.com' },
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result.oid).toBeNull();
+    expect(result.name).toBeNull();
+    expect(result.source_id).toBeNull();
+    expect(result.federated_read).toEqual([]);
+    expect(result.write_prefixes).toEqual([]);
+    expect(result.masked_areas_hidden).toBe(false);
+  });
+
+  test('entra masked_areas_hidden is a bare boolean that never names prefixes', async () => {
+    // Existence-hiding contract (feature/identity-acl): whoami must reveal
+    // THAT areas are hidden, never WHICH — a masked caller could otherwise
+    // enumerate the restricted tree from its own introspection.
+    const auth: AuthInfo = {
+      token: 'eyJ.entra.jwt',
+      clientId: 'entra:masked-user',
+      scopes: ['read', 'write'],
+      expiresAt: 1786950000,
+      entra: { oid: 'masked-user' },
+      hiddenSlugPrefixes: ['restricted/'],
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result.masked_areas_hidden).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('restricted');
+  });
+
+  test('entra claims win over prefix sniffing even with a gbrain_cl_ clientId', async () => {
+    // Defense in depth: if a future verifier ever sets entra claims on a
+    // token whose clientId carries the native prefix, the verified identity
+    // is the truth — claim presence outranks string sniffing.
+    const auth: AuthInfo = {
+      token: 'x',
+      clientId: 'gbrain_cl_shadow',
+      scopes: ['read'],
+      expiresAt: 1,
+      entra: { oid: 'real-oid' },
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+    expect(result.transport).toBe('entra');
+  });
+
   test('legacy transport (token name as clientId, no gbrain_cl_ prefix)', async () => {
     const auth: AuthInfo = {
       token: 'legacy-token',
@@ -205,6 +306,13 @@ describe('whoami op metadata', () => {
   test('description documents OAuth source grant fields', () => {
     expect(whoami.description).toContain('source_id');
     expect(whoami.description).toContain('federated_read');
+  });
+
+  test('description documents the entra transport shape', () => {
+    expect(whoami.description).toContain('"entra"');
+    expect(whoami.description).toContain('upn');
+    expect(whoami.description).toContain('oid');
+    expect(whoami.description).toContain('masked_areas_hidden');
   });
 
   test('scope is read (any authenticated caller can introspect itself)', () => {
