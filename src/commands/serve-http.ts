@@ -64,6 +64,21 @@ import {
 import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
 
+// GBRAIN_MCP_INSTRUCTIONS_FILE (fork divergence, 2026-08-20): serve operating
+// norms to every connecting client via the MCP initialize `instructions` field —
+// the thin-client contract: a bare client gets the brain's rules with zero setup.
+function loadMcpInstructions(): string | undefined {
+  const p = process.env.GBRAIN_MCP_INSTRUCTIONS_FILE;
+  if (!p) return undefined;
+  try {
+    const t = require('node:fs').readFileSync(p, 'utf8').trim();
+    return t || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
  * health-check timeout is 5s, so returning 503 right at the orchestrator
@@ -2035,7 +2050,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // Create a fresh MCP server per request (stateless)
     const server = new Server(
       { name: 'gbrain', version: VERSION },
-      { capabilities: { tools: {} } },
+      { capabilities: { tools: {} }, instructions: loadMcpInstructions() },
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async () => {

@@ -16,10 +16,25 @@ import {
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 
+
+// GBRAIN_MCP_INSTRUCTIONS_FILE (fork divergence, 2026-08-20): serve operating
+// norms to every connecting client via the MCP initialize `instructions` field —
+// the thin-client contract: a bare client gets the brain's rules with zero setup.
+function loadMcpInstructions(): string | undefined {
+  const p = process.env.GBRAIN_MCP_INSTRUCTIONS_FILE;
+  if (!p) return undefined;
+  try {
+    const t = require('node:fs').readFileSync(p, 'utf8').trim();
+    return t || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface } = {}) {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {} }, instructions: loadMcpInstructions() },
   );
 
   // MEMORY_VERBS v1 surface mode: 'full' (default — every op, byte-identical
